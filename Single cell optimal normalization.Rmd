@@ -1,0 +1,488 @@
+
+
+```{r}
+
+#Please, note that this dataset is provided only for understanding the concept of an optimal normalization
+#and does not include any regressions of batch-corrections
+#However, for an average dataset this is more than enough to get meaningful result
+#you'll find similar or simpler approach in a vest majority of the public tutorials
+
+#Try to adjust different values and understand filters impact on final expression
+#Code to create QC plots you'll find here
+#https://hemberg-lab.github.io/scRNA.seq.course/cleaning-the-expression-matrix.html#normalization-practice-reads
+
+#Test dataset does not contain mt genes and spikeIns, but has a lot of rear cell types
+#Try to find filtering thresholds to eliminate some rear cell populations
+#Take any arbitrary dataset form this database https://hemberg-lab.github.io/scRNA.seq.datasets/
+#and have your final cleaned and normalized expression matrix for this dataset ready on the next Wednesday
+library(scater)     #main data container
+library(monocle)    #census relative2abs used for "pseudo-spike-ins" normalization
+library(scran)#zero-inflated normalization by pooling
+
+deng = readRDS(file  =  "D:\\Downloads\\camp1.rds")
+mtx = exprs(deng)
+
+mtx_norm = function(mtx)
+{
+    filter_na_inf = function(mtx)
+    {
+      colsS = Matrix::colSums(mtx)
+      rowsS = Matrix::rowSums(mtx)
+      
+      goodCols = !is.infinite(colsS)&!is.na(colsS)
+      goodRows = !is.infinite(rowsS)&!is.na(rowsS)
+      
+      percC = (table(goodCols)/ncol(mtx))["TRUE"]
+      percR = (table(goodRows)/nrow(mtx))["TRUE"]
+      
+      if(is.na(percR))
+      {
+        mtx = mtx[,goodCols]
+      }else if(is.na(percC))
+      {
+        mtx = mtx[goodRows,]
+      }else if(percC>percR)
+      {
+        mtx = mtx[,goodCols]
+      }else{
+        mtx = mtx[goodRows,]
+      }
+      return(mtx)
+    }
+
+    get_types = function(arr)
+    {
+      return(sapply(arr, function(cell) { return(unlist(strsplit(cell, ".", fixed = T))[1])}))
+    }
+    
+    #rds contains pre-created Single Cell Dataset
+    #lets consider that you don`t have a "counts" slot, pre-normalized "exprs" only
+    #download dataset: https://scrnaseq-public-datasets.s3.amazonaws.com/scater-objects/deng-reads.rds
+    
+    
+    mtx = filter_na_inf(mtx)
+    
+    #census de-normalization expression to read-counts
+    #rel2abs article: https://www.ncbi.nlm.nih.gov/pubmed/28114287
+    fd = as.matrix(rownames(mtx))
+    rownames(fd) = fd
+    colnames(fd)[1]<-"gene_short_name"
+    
+    pd = as.matrix(colnames(mtx))
+    rownames(pd) = pd
+    colnames(pd)[1]<-"cell_name"
+    
+    pd = new("AnnotatedDataFrame", data = as.data.frame(pd))
+    fd = new("AnnotatedDataFrame", data = as.data.frame(fd))
+    
+    
+    relative = newCellDataSet(mtx,
+                               phenoData = pd,
+                               featureData = fd,
+                               lowerDetectionLimit = 0.1,
+                               expressionFamily = tobit(Lower = 0.1))
+    
+    rpc_matrix = relative2abs(relative, t_estimate = estimate_t(exprs(relative)), method = "num_genes", cores = 8)
+    #filter na/inf
+    #census normalization often ends with  some percentage of NaNs for some cells.
+    #keep in mind, that sometimes it can "NaNify"" away up to half of the dataset
+    rpc_matrix = filter_na_inf(rpc_matrix)
+    
+    
+    {
+      #NOTE! This step is outside of the optimal pipeline and logic!
+      #if you've lost too much cells, you can try to normalize lost part separately
+      #and then merge them and then normalize using "normalization through pooling"
+      #or perform a batch-effect regression? marking two datasets as batches
+      #but this is just a dirty hack, never tell anyone that you used it
+      
+      #you can use it only if your "lost cells" seem to be evenly distributed 
+      #in the low-dimensional representation of the dataset
+      #optimal way to visually assess it is to use 
+      #PCA(no less than 50 components) over TSNE (will tell about them in the next lecture)
+      cells_res = setdiff(colnames(mtx), colnames(rpc_matrix))
+      #I will not provide you an implementation, but you may try do it yourself
+    }
+    
+    sce = SingleCellExperiment(assays = list(counts = rpc_matrix), colData = get_types(colnames(rpc_matrix)))
+    rowData(sce)$feature_symbol = rownames(sce)
+    sce = sce[!duplicated(rowData(sce)$feature_symbol), ]
+    
+    #Filter infrequent cells and genes
+    lowerDetectionLimit_cell = 2
+    lowerDetectionLimit_gene = 2
+    numcells_sh = 2
+    numgenes_sh = 2
+    numcells = nexprs(sce, detection_limit = lowerDetectionLimit_cell, byrow = T)
+    keep.gene = numcells >= numcells_sh
+    numgenes = nexprs(sce, detection_limit = lowerDetectionLimit_gene, byrow = F)
+    keep.cell = numgenes >= numgenes_sh
+    
+    
+    #cat("genes_left:", round(length(which(keep.gene))/nrow(sce)*100, 2), "%")
+    #cat("cells_left:", round(length(which(keep.cell))/ncol(sce)*100, 2), "%")
+    sce = sce[keep.gene, keep.cell]
+    
+    #Filter genes that has flat expression profile
+    #Outside of the well-known best practices, good from my experiense
+    gene_levels_sh = 3
+    gene_levels_unique = apply(counts(sce), 1, FUN = unique)
+    gene_levels_lengths = unlist(lapply(gene_levels_unique, length))
+    genes_good = names(which(gene_levels_lengths>=gene_levels_sh))
+    
+    #cat("genes_left:", round(length(genes_good)/nrow(sce)*100, 2), "%")
+    sce = sce[genes_good,]
+    
+    
+    #Set spike-ins
+    is.spike = (grepl("^ERCC-", rownames(sce)) | grepl("^ercc-", rownames(sce)))
+    #we have a special slot for spike-ins in SingleCellExperiment
+    #isSpike(sce, "ercc") = is.spike
+    
+    #MT QC
+    # You can use databases to detect gene symbol annotation and automate gene selection step
+    
+    # detected_genome = detect_genome(rownames(sce))
+    # if(is.null(detected_genome))
+    # {
+    #   return(NULL)
+    # }
+    # anno = get_genome_annotation_names_mapping(detected_genome$org)
+    # #Filter unknown genes
+    # is.mito =  rownames(sce) %in% anno$gene_symbol[which(anno$chr  ==  "MT")]
+    
+    #however here we are using simpler approach
+    is.mito_offline = (grepl("^mt-", rownames(sce)) | grepl("^MT-", rownames(sce)))
+    
+    
+    sce = calculateQCMetrics(sce, 
+                             exprs_values = "counts", 
+                             feature_controls = list(mt = rownames(sce)[which(is.mito_offline)], ercc = rownames(sce)[which(is.spike)]),
+                             cell_controls = NULL,
+                             use_spikes = T
+                             )
+    
+    final_drop = rep(F, ncol(sce))
+    
+    libsize.drop = isOutlier(sce$total_counts, nmads = 3, type = "low", log = T)
+    final_drop = libsize.drop|final_drop
+    
+    feature.drop = isOutlier(sce$total_features_by_counts, nmads = 3, type = "low", log = T)
+    final_drop = feature.drop|final_drop
+    
+    mito.drop = isOutlier(sce$total_counts_mt, nmads = 3, type = "high", log = F)
+    final_drop = mito.drop|final_drop
+    
+    spike.drop = isOutlier(sce$total_counts_ercc, nmads = 3, type = "both", log = F)
+    final_drop = spike.drop|final_drop
+    
+    #cat("cells_left:", round((ncol(sce)-length(which(final_drop)))/ncol(sce)*100, 2), "%")
+    sce = sce[,!final_drop]
+    
+    
+
+    #Calculating size-factors for cells normalization based on our spike-ins separately from all genes
+    if(!is.null(isSpike(sce)))
+    {
+      sce = computeSpikeFactors(sce, general.use = FALSE)
+    }
+    
+    #Calculating main size-factors by cells pooling
+    #article about pooling normalization https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4848819/
+    #I use to use formula like this to calculate norm levels
+    #norm_levels = seq(min(20, max(2, round(ncol(sce)/4))), min(max(2, round(ncol(sce)/2)), 50), 1)
+    norm_sizes = seq(20, 100, 5)
+    #but you can use default values for now
+    sce = computeSumFactors(sce, sizes = norm_sizes, positive = F)
+    
+    #Compute normalized expression values using the size factors stored in the object
+    sce <- normalise(sce)
+    return(sce)
+}
+
+  get_types = function(arr)
+  {
+    return(sapply(arr, function(cell) { return(unlist(strsplit(cell, ".", fixed = T))[1])}))
+  }
+
+
+  library(clusterProfiler)    #genome annotations
+  get_annot_db = function(org)
+  {
+    db_to_use = NULL
+    if(org %in% c("human", "h"))
+    {
+      db_to_use = "org.Hs.eg.db"
+    }
+    if(org %in% c("mouse", "m"))
+    {
+      db_to_use = "org.Mm.eg.db"
+    }
+    return(db_to_use)
+  }
+  
+  gene_annot_convert_to = function(gene_names, new_encoding = "ENTREZID", org, annot)
+  {
+   
+    old_encoding = toupper(annot)
+    
+    org_db = get_annot_db(org)
+    
+    new_encoding = toupper(new_encoding)
+
+    if(new_encoding  ==  old_encoding)
+    {
+      return (list(old = gene_names, new = gene_names))
+    }
+    
+    gene_annot_mapping = as.matrix(bitr(gene_names, fromType = old_encoding, toType = new_encoding, OrgDb = org_db))
+    return(list(old = gene_annot_mapping[,1], new = gene_annot_mapping[,2]))
+  }
+  
+  magic_impute = function (mtx, primal_components = 20)
+  {
+    df2matrix<-function(DF)
+    {
+      rows = DF[[1]]
+      DF = DF[,2:ncol(DF)]
+      DF = t(as.matrix(DF))
+      colnames(DF) = rows
+      storage.mode(DF) = "numeric"
+      return (DF)
+    }
+    
+    
+    file_in = paste0(digest::digest(mtx), "_for_magic_exprs.csv")
+    file_out = paste0(digest::digest(mtx), "_magic_out.csv")
+    
+    write.csv(as.matrix(mtx), file = file_in)
+
+    tryCatch(system(paste0('bash -c "MAGIC.py -d ', file_in, ' -o ', file_out, ' -n --cell-axis \'columns\' -p ', min(primal_components, nrow(mtx)),' csv"')))
+
+    mtx = data.table::fread(file_out, header = T, sep = ',', verbose = F, showProgress = F, blank.lines.skip = T)
+    
+    magic_imputed = tryCatch(na.omit(df2matrix(mtx)), error = function(e){NULL})
+    
+    unlink(file_in)
+    unlink(file_out)
+    
+    return (magic_imputed)
+  }
+
+
+  normalized = mtx_norm(mtx)
+  
+  #magic = magic_impute(as.matrix(object@data), primal_components = ncol(GetCellEmbeddings(object, reduction.type = "pca")))
+  # if(!is.null(magic))
+  # {
+  #   print("magic")
+  #   object@raw.data = as(object@raw.data[, colnames(magic)], "dgCMatrix")
+  #   object@data = as(magic, "dgCMatrix")
+  # }
+  
+
+  library(Seurat)
+  
+  #raw???
+  raw = 2^exprs(normalized)-1
+  
+  
+  object = CreateSeuratObject(
+    raw.data = as(raw, "dgCMatrix"), 
+    
+    #exprs???
+    data = as(normalized, "dgCMatrix")
+    )
+    
+  
+  object@meta.data[, "orig.ident"] = get_types(colnames(object@data))
+  
+  #no need?
+  #object = NormalizeData(object = object, normalization.method = NULL, display.progress = F, scale.factor = 1)
+  
+  
+  # vars_to_regress = NULL
+  # 
+  # vars_to_regress = c(vars_to_regress, "nUMI")
+  # 
+  # #cc = readRDS(system.file("exdata", "human_cycle_markers.rds", package = "scran"))
+  # cc = readRDS(system.file("exdata", "mouse_cycle_markers.rds", package = "scran"))
+  # 
+  # (cc$G1$first)
+  # rownames(object@data)
+  # G2M = gene_annot_convert_to(unique(cc$G2M$first), new_encoding = "SYMBOL", org = "mouse", annot = "ENSEMBL")$new
+  # S = gene_annot_convert_to(unique(cc$S$first), new_encoding = "SYMBOL", org = "mouse", annot = "ENSEMBL")$new
+  # 
+  # #obj1
+  # object1 = tryCatch(CellCycleScoring(object, G2M, S, set.ident = F), error = function(e){NULL})
+  # 
+  # if(!is.null(object1))
+  # {
+  #   object = object1
+  #   rm(object1)
+  #   
+  #   #cc_diff?
+  #   # {
+  #   #   object@meta.data$CC.Difference = object@meta.data$S.Score - object@meta.data$G2M.Score
+  #   #   vars_to_regress = c(vars_to_regress, "CC.Difference")
+  #   # }
+  #   
+  #   #cell cycle rregression
+  #   {
+  #     vars_to_regress = c(vars_to_regress, "S.Score", "G2M.Score")
+  #   }
+  #   
+  # }else{
+  #   stop(1)
+  # }
+  
+  
+  # if(!is.null(vars_to_regress))
+  # {
+  #   object = ScaleData(object = object, vars.to.regress = vars_to_regress, display.progress = T, check.for.norm = F, do.center = T, do.scale = T)
+  # }else{
+    object = ScaleData(object = object, display.progress = T, check.for.norm = F, do.center = T, do.scale = T)
+  # }
+  
+  # object = FindVariableGenes(object, display.progress = F, do.plot = T, binning.method = "equal_frequency")
+  
+  # object1 = RunPCA(object = object, pc.genes = object@var.genes, 
+  #                             print.results = TRUE, 
+  #                             pcs.print = 1:5, do.print = T, 
+  #                             pcs.compute = 30, rev.pca = F,
+  #                             weight.by.var = T)
+  
+  object1 = RunPCA(object = object, pc.genes = rownames(object@data),
+                              print.results = TRUE,
+                              pcs.print = 1:5, do.print = T,
+                              pcs.compute = 30, rev.pca = F,
+                              weight.by.var = T)
+  
+  if(!is.null(object1))
+  {
+    object = object1
+    rm(object1)
+  }
+  
+  DimPlot(object, reduction.use = "pca", group.by = "orig.ident", dim.1 = 10, dim.2 = 11)
+  
+  object1 = RunTSNE(object = object, dims.use = 1:10,
+                                 dim.embed = 2, 
+                                 check_duplicates = FALSE, 
+                                 perplexity = 15)
+  if(!is.null(object1))
+  {
+    object = object1
+    rm(object1)
+  }
+  
+  DimPlot(object, reduction.use = "tsne", group.by = "orig.ident")
+
+  object = FindClusters(object = object,
+                    dims.use = 1:ncol(GetCellEmbeddings(object, reduction.type = "tsne")),
+                    reduction.type = "tsne", 
+                    resolution = 0.2, 
+                    k.param = 20, algorithm = 3,
+                    modularity.fxn = 1, print.output = F, save.SNN = T, force.recalc = F, 
+                    prune.SNN = 0.15, 
+                    n.start = 10)
+    
+  DimPlot(object, reduction.use = "tsne", group.by = "ident")
+  
+  p1 = TSNEPlot(object = object, group.by = "orig.ident", do.return = TRUE, pt.size = 1.5)
+  p2 = TSNEPlot(object = object, do.return = TRUE, pt.size = 1.5)
+  plot_grid(p1, p2)
+  
+  #plot_seur_3d(object)
+  
+  cl_markers = FindAllMarkers(object, test.use = "MAST", logfc.threshold = 1, 
+                                                 return.thresh = 0.01, only.pos = F, min.pct = 0.7, print.bar = F, latent.vars = c("nUMI", "nGene"))
+  
+
+  cl_markers
+  
+  # cl_markers[which(cl_markers$cluster %in% "4"),]
+  # 
+  # cluster_subset = cl_markers[which(cl_markers$cluster %in% "4"),]
+  # cluster_subset = cluster_subset[order(cluster_subset$avg_logFC, decreasing = T),]
+  # 
+  # cluster_subset$gene
+  # cl_markers[which(cl_markers$gene %in% markers_of_interest),]$gene
+  # 
+  # 
+  # for(gene in cl_markers[which(cl_markers$gene %in% markers_of_interest),]$gene)
+  # {
+  #   FeaturePlot(object = object, reduction.use = "tsne", features.plot = gene, cols.use = c("red", "green"))
+  # }
+  # 
+
+  
+```
+
+
+<!-- ```{r} -->
+<!-- library(fgsea) -->
+<!-- #library(PANTHER.db) -->
+<!-- library(GO.db) -->
+
+<!-- # "CLASS_ID|CLASS_TERM|COMPONENT_ID|COMPONENT_TERM|CONFIDENCE_CODE|ENTREZ|EVIDENCE|EVIDENCE_TYPE|FAMILY_ID|FAMILY_TERM|GOSLIM_ID|GOSLIM_TERM|PATHWAY_ID|PATHWAY_TERM|SPECIES|SUBFAMILY_TERM|UNIPROT" -->
+<!-- #  -->
+
+<!-- pathways <- readRDS("F:\\bioinf\\Sk\\SingleCellRNASeq\\10_VS\\Proj\\GO_mouse_dataset.rds") -->
+<!-- head(pathways) -->
+
+
+<!-- markers<-cl_markers -->
+
+<!-- #genome = detect_genome(markers$gene) -->
+<!-- #pthOrganisms(PANTHER.db) <- toupper(genome$org) -->
+
+<!-- symbol_converted = gene_annot_convert_to(markers$gene, org = "mouse", annot = "symbol", new_encoding = "symbol") -->
+<!-- markers$gene_symbol = symbol_converted$new[match(markers$gene, symbol_converted$old)] -->
+<!-- markers = markers[which(!is.na(markers$gene_symbol)),] -->
+
+<!-- head(markers) -->
+<!-- head(names(pathways)) -->
+<!-- head(pathways) -->
+<!-- ``` -->
+
+
+<!-- ```{r} -->
+<!-- clusters = levels(markers$cluster) -->
+<!-- l = NULL -->
+<!-- i = 0 -->
+
+<!-- for (cluster in clusters){ -->
+
+<!--   try({ -->
+<!--   i=i+1 -->
+<!--   cl_ranked_list = markers[markers$cluster == cluster,]$avg_logFC*-log10(markers[markers$cluster == cluster,]$p_val_adj) -->
+<!--   names(cl_ranked_list) = markers[markers$cluster == cluster,]$gene_symbol -->
+<!--   cl_ranked_list = sort(cl_ranked_list, decreasing = T) -->
+<!--   cl_fgseaRes = fgsea(pathways = pathways, -->
+<!--                   stats = cl_ranked_list, -->
+<!--                   nperm=1000) -->
+<!--   cl_fgseaRes = cl_fgseaRes[order(padj, decreasing = T)] -->
+<!--   cl_fgseaRes$cluster = rep(cluster, nrow(cl_fgseaRes)) -->
+
+<!--   l = rbind(l, cl_fgseaRes) -->
+
+<!--   topPathwaysUp = cl_fgseaRes[ES > 0][head(order(pval), n=10), pathway] -->
+<!--    l[[i]] = plotGseaTable(pathways[topPathwaysUp], cl_ranked_list, cl_fgseaRes, -->
+<!--                gseaParam = 0.5, colwidths = c(10,2,2,2,2)) -->
+<!--   }) -->
+<!-- } -->
+
+<!-- print(l[order(padj)]) -->
+
+<!-- plot(sort(l$padj)) -->
+<!-- plot(sort(markers$p_val)) -->
+
+
+<!-- ``` -->
+
+<!-- ```{r} -->
+<!-- png("GSEA.png", height = 3800, width = 3800) -->
+<!-- cowplot::plot_grid(plotlist = l, labels = clusters, label_size = 30) -->
+
+<!-- ``` -->
